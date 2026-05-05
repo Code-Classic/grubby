@@ -52,6 +52,29 @@ public class TimelineJob {
     @Column(columnDefinition = "LONGTEXT")
     private String markdownContent;
 
+    /** UUID share token — set when the user shares this timeline publicly. */
+    @Column(unique = true, length = 36)
+    private String shareToken;
+
+    @Column(nullable = false)
+    @Builder.Default
+    private boolean isPublic = false;
+
+    /** JSON array of CommitSnapshot — powers the interactive visual timeline. */
+    @Lob
+    @Column(columnDefinition = "LONGTEXT")
+    private String commitDataJson;
+
+    /** JSON-serialised ContributionSummary — per-author stats and knowledge silos. */
+    @Lob
+    @Column(columnDefinition = "LONGTEXT")
+    private String contributionJson;
+
+    /** JSON array of ArchitectureSignal — detected architectural inflection points. */
+    @Lob
+    @Column(columnDefinition = "LONGTEXT")
+    private String architectureJson;
+
     private Instant createdAt;
     private Instant updatedAt;
 

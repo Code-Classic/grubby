@@ -1,6 +1,7 @@
 package com.codeclassic.grubby.service.orchestrator;
 
 import com.codeclassic.grubby.api.dto.GenerateTimelineRequest;
+import com.codeclassic.grubby.api.dto.ShareTimelineResponse;
 import com.codeclassic.grubby.api.dto.TimelineStatusResponse;
 import com.codeclassic.grubby.domain.entity.TimelineJob;
 import com.codeclassic.grubby.domain.entity.TimelineStatus;
@@ -8,6 +9,7 @@ import com.codeclassic.grubby.repository.TimelineJobRepository;
 import com.codeclassic.grubby.service.timeline.TimelineJobRunner;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
@@ -18,8 +20,7 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.web.server.ResponseStatusException;
 
-import java.util.List;
-import java.util.stream.Collectors;
+import java.util.UUID;
 
 @Slf4j
 @Service
@@ -28,6 +29,9 @@ public class TimelineOrchestratorService {
 
     private final TimelineJobRepository repo;
     private final TimelineJobRunner jobRunner;
+
+    @Value("${app.frontend-url:http://localhost:5173}")
+    private String frontendUrl;
 
     @Transactional
     public Long submit(GenerateTimelineRequest req, String userId) {
@@ -43,7 +47,6 @@ public class TimelineOrchestratorService {
         repo.save(job);
 
         final Long id = job.getId();
-        // Fire after commit so the worker's findById() sees the row
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override public void afterCommit() { jobRunner.runAsync(id); }
         });
@@ -54,8 +57,7 @@ public class TimelineOrchestratorService {
 
     @Transactional(readOnly = true)
     public TimelineStatusResponse status(Long id) {
-        TimelineJob job = findOrThrow(id);
-        return toStatusResponse(job);
+        return toStatusResponse(findOrThrow(id));
     }
 
     @Transactional(readOnly = true)
@@ -73,6 +75,60 @@ public class TimelineOrchestratorService {
         size = Math.min(size, 50);
         return repo.findByUserIdOrderByCreatedAtDesc(userId,
                 PageRequest.of(page, size, Sort.by("createdAt").descending()));
+    }
+
+    /** Generates (or returns existing) a public share token for a completed timeline. */
+    @Transactional
+    public ShareTimelineResponse share(Long id, String userId) {
+        TimelineJob job = findOrThrow(id);
+        if (!job.getUserId().equals(userId)) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Not your timeline");
+        }
+        if (job.getStatus() != TimelineStatus.COMPLETED) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Only completed timelines can be shared");
+        }
+        if (job.getShareToken() == null) {
+            job.setShareToken(UUID.randomUUID().toString());
+            job.setPublic(true);
+            repo.save(job);
+        }
+        String url = frontendUrl + "/timeline/public/" + job.getShareToken();
+        return new ShareTimelineResponse(job.getShareToken(), url);
+    }
+
+    /** Public access — no userId check, token is the proof. */
+    @Transactional(readOnly = true)
+    public TimelineJob getByShareToken(String token) {
+        TimelineJob job = repo.findByShareToken(token)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND,
+                        "Timeline not found"));
+        if (!job.isPublic() || job.getStatus() != TimelineStatus.COMPLETED) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Timeline not available");
+        }
+        return job;
+    }
+
+    /** Returns raw JSON commit snapshot array for the visual timeline. */
+    @Transactional(readOnly = true)
+    public String visualData(Long id) {
+        TimelineJob job = findOrThrow(id);
+        String json = job.getCommitDataJson();
+        return (json != null && !json.isBlank()) ? json : "[]";
+    }
+
+    @Transactional(readOnly = true)
+    public String contributionData(Long id) {
+        TimelineJob job = findOrThrow(id);
+        String json = job.getContributionJson();
+        return (json != null && !json.isBlank()) ? json : "{}";
+    }
+
+    @Transactional(readOnly = true)
+    public String architectureData(Long id) {
+        TimelineJob job = findOrThrow(id);
+        String json = job.getArchitectureJson();
+        return (json != null && !json.isBlank()) ? json : "[]";
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

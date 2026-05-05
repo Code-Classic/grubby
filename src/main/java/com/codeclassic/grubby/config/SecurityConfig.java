@@ -63,6 +63,8 @@ public class SecurityConfig {
                         "/api/v1/auth/refresh").permitAll()
                 // GitHub OAuth callback is public (arrives from GitHub redirect)
                 .requestMatchers(HttpMethod.GET, "/api/v1/auth/github/callback").permitAll()
+                // Public shared timelines — accessible without auth via share token
+                .requestMatchers(HttpMethod.GET, "/api/v1/timeline/public/**").permitAll()
                 // Health check — public (avoids alerting noise)
                 .requestMatchers(HttpMethod.GET, "/actuator/health").permitAll()
                 // Swagger — public (restrict in prod if needed)
