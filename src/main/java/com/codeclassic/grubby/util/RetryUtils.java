@@ -1,16 +1,24 @@
 package com.codeclassic.grubby.util;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.time.Duration;
-import java.util.Random;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Predicate;
 
 /**
  * Simple retry helper with exponential backoff and jitter.
+ *
+ * Improvements:
+ * - Uses ThreadLocalRandom instead of a shared Random (thread-safe, no contention)
+ * - InterruptedException correctly restores interrupt status before re-throwing
+ * - Logs each retry attempt with delay information
  */
 public final class RetryUtils {
 
-    private static final Random RANDOM = new Random();
+    private static final Logger log = LoggerFactory.getLogger(RetryUtils.class);
 
     private RetryUtils() {}
 
@@ -27,6 +35,7 @@ public final class RetryUtils {
 
         Duration delay = initialDelay;
         int tryNo = 0;
+
         while (true) {
             tryNo++;
             try {
@@ -34,14 +43,23 @@ public final class RetryUtils {
             } catch (Throwable ex) {
                 boolean shouldRetry = tryNo < attempts && (retryIf == null || retryIf.test(ex));
                 if (!shouldRetry) {
-                    if (ex instanceof Exception e) throw e; else throw new Exception(ex);
+                    if (ex instanceof Exception e) throw e;
+                    throw new RuntimeException(ex);
                 }
-                // jitter: +/- 20%
+                // Jitter ±20% of base delay using ThreadLocalRandom (no shared state)
                 long baseMs = delay.toMillis();
-                long jitter = (long) (baseMs * (0.4 * RANDOM.nextDouble() - 0.2));
+                long jitter = (long) (baseMs * (0.4 * ThreadLocalRandom.current().nextDouble() - 0.2));
                 long sleepMs = Math.max(50, baseMs + jitter);
-                try { Thread.sleep(sleepMs); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-                delay = Duration.ofMillis((long) Math.min(Integer.MAX_VALUE, baseMs * backoff));
+                log.warn("Attempt {}/{} failed ({}). Retrying in {}ms...",
+                        tryNo, attempts, ex.getClass().getSimpleName(), sleepMs);
+                try {
+                    Thread.sleep(sleepMs);
+                } catch (InterruptedException ie) {
+                    // Restore interrupt status before propagating
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Retry interrupted", ie);
+                }
+                delay = Duration.ofMillis((long) Math.min(30_000L, baseMs * backoff));
             }
         }
     }

@@ -1,0 +1,77 @@
+name: 'Grubby BRD Generator'
+description: 'Generate a BRD from a GitHub repository using Grubby AI'
+author: 'Grubby'
+
+branding:
+  icon: 'file-text'
+  color: 'purple'
+
+inputs:
+  grubby-url:
+    description: 'Base URL of your Grubby backend (e.g. https://grubby.yourdomain.com)'
+    required: true
+  email:
+    description: 'Grubby account email'
+    required: true
+  password:
+    description: 'Grubby account password'
+    required: true
+    default: ''
+  repo-url:
+    description: 'Repository URL to analyze (defaults to the current repo)'
+    required: false
+    default: ''
+  branch:
+    description: 'Branch to analyze (defaults to current branch)'
+    required: false
+    default: ''
+  feature-context:
+    description: 'Optional feature description to guide the BRD generation'
+    required: false
+    default: ''
+  ai-model:
+    description: 'AI model to use (e.g. gpt-4o-mini, claude-opus-4-7). Blank = server default.'
+    required: false
+    default: ''
+  output-format:
+    description: 'Output format: md, pdf, or docx'
+    required: false
+    default: 'md'
+  github-token:
+    description: 'GitHub token for posting a PR comment (optional)'
+    required: false
+    default: ''
+  poll-timeout-seconds:
+    description: 'Max seconds to wait for BRD generation (default 600)'
+    required: false
+    default: '600'
+
+outputs:
+  brd-id:
+    description: 'The BRD job ID assigned by Grubby'
+    value: ${{ steps.generate.outputs.brd-id }}
+  brd-url:
+    description: 'Direct link to the BRD in the Grubby UI'
+    value: ${{ steps.generate.outputs.brd-url }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Generate BRD
+      id: generate
+      shell: bash
+      env:
+        GRUBBY_URL: ${{ inputs.grubby-url }}
+        GRUBBY_EMAIL: ${{ inputs.email }}
+        GRUBBY_PASSWORD: ${{ inputs.password }}
+        REPO_URL: ${{ inputs.repo-url }}
+        BRANCH: ${{ inputs.branch }}
+        FEATURE_CONTEXT: ${{ inputs.feature-context }}
+        AI_MODEL: ${{ inputs.ai-model }}
+        OUTPUT_FORMAT: ${{ inputs.output-format }}
+        GITHUB_TOKEN_INPUT: ${{ inputs.github-token }}
+        POLL_TIMEOUT: ${{ inputs.poll-timeout-seconds }}
+        GH_REPO: ${{ github.repository }}
+        GH_SHA: ${{ github.sha }}
+        GH_PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: ${{ github.action_path }}/generate.sh

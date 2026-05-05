@@ -1,11 +1,14 @@
 package com.codeclassic.grubby.service.ai;
 
+import com.codeclassic.grubby.config.ApiKeyConfig;
+import com.codeclassic.grubby.util.RetryUtils;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.codeclassic.grubby.config.ApiKeyConfig;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.net.URI;
@@ -15,121 +18,354 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 
-/**
- * Minimal AI service that sends a prompt (repoUrl + feature context) to OpenAI Chat Completions API
- * and returns Markdown text suitable for preview. If no API key is configured, it returns a
- * deterministic stub based on inputs.
- */
 @Service
 @RequiredArgsConstructor
 public class AiProcessingService {
 
-    @org.springframework.beans.factory.annotation.Value("${retry.llm.attempts:3}")
+    private static final Logger log = LoggerFactory.getLogger(AiProcessingService.class);
+    private static final int MAX_SUMMARY_CHARS = 5_000;
+
+    @Value("${retry.llm.attempts:3}")
     private int retryAttempts;
-    @org.springframework.beans.factory.annotation.Value("${retry.llm.initialDelayMillis:2000}")
+
+    @Value("${retry.llm.initialDelayMillis:2000}")
     private long retryInitialDelayMs;
-    @org.springframework.beans.factory.annotation.Value("${retry.llm.backoff:1.8}")
+
+    @Value("${retry.llm.backoff:1.8}")
     private double retryBackoff;
-    @org.springframework.beans.factory.annotation.Value("${llm.http.timeout.seconds:60}")
+
+    @Value("${llm.http.timeout.seconds:60}")
     private int httpTimeoutSeconds;
 
-    private static final Logger log = LoggerFactory.getLogger(AiProcessingService.class);
+    // OpenAI config
+    @Value("${llm.model:gpt-4o-mini}")
+    private String defaultOpenAiModel;
+
+    @Value("${llm.temperature:0.2}")
+    private double llmTemperature;
+
+    @Value("${llm.api.endpoint:https://api.openai.com/v1/chat/completions}")
+    private String openAiEndpoint;
+
+    // Claude config
+    @Value("${claude.api.endpoint:https://api.anthropic.com/v1/messages}")
+    private String claudeEndpoint;
+
+    @Value("${claude.api.version:2023-06-01}")
+    private String claudeApiVersion;
+
+    @Value("${claude.max.tokens:4096}")
+    private int claudeMaxTokens;
 
     private final ApiKeyConfig apiKeyConfig;
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final ObjectMapper objectMapper;
 
-    public String generateMarkdown(String repoUrl, String featureContext) {
-        return generateMarkdown(repoUrl, featureContext, null);
+    private HttpClient httpClient;
+
+    @PostConstruct
+    public void init() {
+        httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .build();
     }
 
-    public String generateMarkdown(String repoUrl, String featureContext, Object summaryOrNull) {
-        if (!apiKeyConfig.isConfigured()) {
-            // Fallback: simple stub
-            String fc = featureContext == null || featureContext.isBlank() ? "(no feature context provided)" : featureContext;
-            return "# BRD (Stub)\n\n" +
-                    "## Overview & Purpose\n" +
-                    "This is a placeholder BRD generated without a configured LLM API key.\n\n" +
-                    "## Input Summary\n" +
-                    "- Repository: " + repoUrl + "\n" +
-                    "- Feature Context: " + fc + "\n\n" +
-                    (summaryOrNull != null ? ("- Code Summary (truncated):\n```json\n" + safeJson(summaryOrNull) + "\n```\n\n") : "") +
-                    "## Suggested Next Steps\n" +
-                    "1. Configure llm.api.key in application.properties.\n" +
-                    "2. Re-run generation to receive AI-based content.";
+    // ── Public API ────────────────────────────────────────────────────────────
+
+    public String generateMarkdown(String repoUrl, String featureContext) {
+        return generateMarkdown(repoUrl, featureContext, null, null);
+    }
+
+    public String generateMarkdown(String repoUrl, String featureContext, Object codeSummary) {
+        return generateMarkdown(repoUrl, featureContext, codeSummary, null);
+    }
+
+    public String generateMarkdown(String repoUrl, String featureContext, Object codeSummary, String aiModel) {
+        String model = resolveModel(aiModel);
+        boolean isClaude = isClaude(model);
+
+        if (isClaude && !apiKeyConfig.isClaudeConfigured()) {
+            log.warn("Claude API key not configured — returning stub BRD");
+            return buildStubMarkdown(repoUrl, featureContext, codeSummary);
+        }
+        if (!isClaude && !apiKeyConfig.isConfigured()) {
+            log.warn("LLM API key not configured — returning stub BRD");
+            return buildStubMarkdown(repoUrl, featureContext, codeSummary);
         }
 
         try {
-            String apiKey = apiKeyConfig.getApiKey();
-            String prompt = buildPrompt(repoUrl, featureContext, summaryOrNull);
-            String body = objectMapper.createObjectNode()
-                    .put("model", "gpt-4o-mini")
-                    .put("temperature", 0.2)
-                    .set("messages", objectMapper.createArrayNode()
-                            .add(objectMapper.createObjectNode()
-                                    .put("role", "system")
-                                    .put("content", "You are a senior Business Analyst. Produce a concise, well-structured BRD in Markdown with sections: Overview, Existing System Summary (if any), Proposed Changes, Business Rules, APIs to Consider, Risks & Assumptions, and Next Steps."))
-                            .add(objectMapper.createObjectNode()
-                                    .put("role", "user")
-                                    .put("content", prompt))
-                    ).toString();
+            String prompt = buildPrompt(repoUrl, featureContext, codeSummary);
+            String requestBody = isClaude
+                    ? buildClaudeRequestBody(model, prompt)
+                    : buildOpenAiRequestBody(model, prompt);
+            Duration timeout = Duration.ofSeconds(Math.max(10, httpTimeoutSeconds));
 
-            java.time.Duration timeout = java.time.Duration.ofSeconds(Math.max(10, httpTimeoutSeconds));
-            final String apiEndpoint = "https://api.openai.com/v1/chat/completions";
+            return RetryUtils.withRetry(
+                    () -> isClaude ? callClaude(requestBody, timeout) : callOpenAi(requestBody, timeout),
+                    retryAttempts,
+                    Duration.ofMillis(Math.max(200L, retryInitialDelayMs)),
+                    retryBackoff,
+                    ex -> true);
 
-            String result = com.codeclassic.grubby.util.RetryUtils.withRetry(() -> {
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(URI.create(apiEndpoint))
-                        .timeout(timeout)
-                        .header("Authorization", "Bearer " + apiKey)
-                        .header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
-                        .build();
-
-                HttpClient client = HttpClient.newHttpClient();
-                HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-
-                if (response.statusCode() / 100 != 2) {
-                    throw new RuntimeException("LLM non-2xx: status=" + response.statusCode());
-                }
-                JsonNode root = objectMapper.readTree(response.body());
-                JsonNode contentNode = root.path("choices").path(0).path("message").path("content");
-                String content = contentNode.isMissingNode() ? null : contentNode.asText();
-                if (content == null || content.isBlank()) {
-                    throw new RuntimeException("LLM empty content");
-                }
-                return content.trim();
-            }, retryAttempts, java.time.Duration.ofMillis(Math.max(200L, retryInitialDelayMs)), retryBackoff, ex -> true);
-            return result;
         } catch (Exception ex) {
-            log.error("LLM call error", ex);
-            return fallbackMarkdown(repoUrl, featureContext, "LLM error: " + ex.getClass().getSimpleName());
+            log.error("LLM call failed after retries: {}", ex.getClass().getSimpleName());
+            throw new RuntimeException("AI generation failed: " + ex.getClass().getSimpleName(), ex);
         }
     }
 
-    private String buildPrompt(String repoUrl, String featureContext) {
-        return buildPrompt(repoUrl, featureContext, null);
+    /**
+     * Generic LLM call with caller-supplied system prompt and user message.
+     * Used by the timeline generator and any other non-BRD AI tasks.
+     * Falls back to the default model if aiModel is null/blank.
+     */
+    public String callLlmRaw(String systemPrompt, String userMessage, String aiModel) {
+        String model = resolveModel(aiModel);
+        boolean isClaude = isClaude(model);
+
+        if (isClaude && !apiKeyConfig.isClaudeConfigured()) {
+            throw new RuntimeException("Claude API key not configured");
+        }
+        if (!isClaude && !apiKeyConfig.isConfigured()) {
+            throw new RuntimeException("LLM API key not configured");
+        }
+
+        try {
+            String requestBody = isClaude
+                    ? buildClaudeRawRequestBody(model, systemPrompt, userMessage)
+                    : buildOpenAiRawRequestBody(model, systemPrompt, userMessage);
+            Duration timeout = Duration.ofSeconds(Math.max(10, httpTimeoutSeconds));
+
+            return RetryUtils.withRetry(
+                    () -> isClaude ? callClaude(requestBody, timeout) : callOpenAi(requestBody, timeout),
+                    retryAttempts,
+                    Duration.ofMillis(Math.max(200L, retryInitialDelayMs)),
+                    retryBackoff,
+                    ex -> true);
+        } catch (Exception ex) {
+            log.error("LLM raw call failed after retries: {}", ex.getClass().getSimpleName());
+            throw new RuntimeException("AI call failed: " + ex.getClass().getSimpleName(), ex);
+        }
     }
 
-    private String buildPrompt(String repoUrl, String featureContext, Object summaryOrNull) {
+    private String buildOpenAiRawRequestBody(String model, String systemPrompt, String userMessage) throws Exception {
+        return objectMapper.createObjectNode()
+                .put("model", model)
+                .put("temperature", llmTemperature)
+                .set("messages", objectMapper.createArrayNode()
+                        .add(objectMapper.createObjectNode()
+                                .put("role", "system").put("content", systemPrompt))
+                        .add(objectMapper.createObjectNode()
+                                .put("role", "user").put("content", userMessage)))
+                .toString();
+    }
+
+    private String buildClaudeRawRequestBody(String model, String systemPrompt, String userMessage) throws Exception {
+        return objectMapper.createObjectNode()
+                .put("model", model)
+                .put("max_tokens", claudeMaxTokens)
+                .put("system", systemPrompt)
+                .set("messages", objectMapper.createArrayNode()
+                        .add(objectMapper.createObjectNode()
+                                .put("role", "user").put("content", userMessage)))
+                .toString();
+    }
+
+    public String refineMarkdown(String currentMarkdown, String userPrompt) {
+        return refineMarkdown(currentMarkdown, userPrompt, null);
+    }
+
+    public String refineMarkdown(String currentMarkdown, String userPrompt, String aiModel) {
+        String model = resolveModel(aiModel);
+        boolean isClaude = isClaude(model);
+
+        if (isClaude && !apiKeyConfig.isClaudeConfigured()) {
+            throw new RuntimeException("Claude API key not configured — cannot refine");
+        }
+        if (!isClaude && !apiKeyConfig.isConfigured()) {
+            throw new RuntimeException("LLM API key not configured — cannot refine");
+        }
+
+        try {
+            String requestBody = isClaude
+                    ? buildClaudeRefineRequestBody(model, currentMarkdown, userPrompt)
+                    : buildOpenAiRefineRequestBody(currentMarkdown, userPrompt);
+            Duration timeout = Duration.ofSeconds(Math.max(10, httpTimeoutSeconds));
+
+            return RetryUtils.withRetry(
+                    () -> isClaude ? callClaude(requestBody, timeout) : callOpenAi(requestBody, timeout),
+                    retryAttempts,
+                    Duration.ofMillis(Math.max(200L, retryInitialDelayMs)),
+                    retryBackoff,
+                    ex -> true);
+
+        } catch (Exception ex) {
+            log.error("LLM refinement failed after retries: {}", ex.getClass().getSimpleName());
+            throw new RuntimeException("AI refinement failed: " + ex.getClass().getSimpleName(), ex);
+        }
+    }
+
+    // ── Provider dispatch helpers ─────────────────────────────────────────────
+
+    private String resolveModel(String aiModel) {
+        return (aiModel != null && !aiModel.isBlank()) ? aiModel.trim() : defaultOpenAiModel;
+    }
+
+    private boolean isClaude(String model) {
+        return model.startsWith("claude-");
+    }
+
+    // ── OpenAI call ───────────────────────────────────────────────────────────
+
+    private String callOpenAi(String requestBody, Duration timeout) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(openAiEndpoint))
+                .timeout(timeout)
+                .header("Authorization", "Bearer " + apiKeyConfig.getApiKey())
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(requestBody, StandardCharsets.UTF_8))
+                .build();
+
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+
+        if (response.statusCode() / 100 != 2) {
+            log.warn("OpenAI returned non-2xx status: {}", response.statusCode());
+            throw new RuntimeException("OpenAI non-2xx: status=" + response.statusCode());
+        }
+        JsonNode root = objectMapper.readTree(response.body());
+        JsonNode contentNode = root.path("choices").path(0).path("message").path("content");
+        String content = contentNode.isMissingNode() ? null : contentNode.asText();
+        if (content == null || content.isBlank()) {
+            throw new RuntimeException("OpenAI returned empty content");
+        }
+        return content.trim();
+    }
+
+    private String buildOpenAiRequestBody(String model, String prompt) throws Exception {
+        return objectMapper.createObjectNode()
+                .put("model", model)
+                .put("temperature", llmTemperature)
+                .set("messages", objectMapper.createArrayNode()
+                        .add(objectMapper.createObjectNode()
+                                .put("role", "system")
+                                .put("content",
+                                        "You are a senior Business Analyst. Produce a concise, well-structured BRD in Markdown " +
+                                        "with these sections: Overview & Purpose, Existing System Summary, Proposed Changes, " +
+                                        "Business Rules, APIs to Consider, Risks & Assumptions, and Next Steps. " +
+                                        "Be specific, actionable, and reference actual endpoints or classes where relevant."))
+                        .add(objectMapper.createObjectNode()
+                                .put("role", "user")
+                                .put("content", prompt)))
+                .toString();
+    }
+
+    private String buildOpenAiRefineRequestBody(String currentMarkdown, String userPrompt) throws Exception {
+        String truncated = currentMarkdown.length() > 12_000
+                ? currentMarkdown.substring(0, 12_000) + "\n… (truncated)"
+                : currentMarkdown;
+        return objectMapper.createObjectNode()
+                .put("model", defaultOpenAiModel)
+                .put("temperature", llmTemperature)
+                .set("messages", objectMapper.createArrayNode()
+                        .add(objectMapper.createObjectNode()
+                                .put("role", "system")
+                                .put("content",
+                                        "You are a senior Business Analyst editing an existing BRD. " +
+                                        "Apply the user's instruction to the BRD and return the complete revised document " +
+                                        "in Markdown. Keep the same structure (Overview & Purpose, Existing System Summary, " +
+                                        "Proposed Changes, Business Rules, APIs to Consider, Risks & Assumptions, Next Steps) " +
+                                        "unless the instruction explicitly requires changes to it. " +
+                                        "Return only the full revised Markdown — no preamble, no explanation."))
+                        .add(objectMapper.createObjectNode()
+                                .put("role", "user")
+                                .put("content", "Existing BRD:\n\n" + truncated + "\n\n---\n\nInstruction: " + userPrompt)))
+                .toString();
+    }
+
+    // ── Claude call ───────────────────────────────────────────────────────────
+
+    private String callClaude(String requestBody, Duration timeout) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(claudeEndpoint))
+                .timeout(timeout)
+                .header("x-api-key", apiKeyConfig.getClaudeApiKey())
+                .header("anthropic-version", claudeApiVersion)
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(requestBody, StandardCharsets.UTF_8))
+                .build();
+
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+
+        if (response.statusCode() / 100 != 2) {
+            log.warn("Claude API returned non-2xx status: {}", response.statusCode());
+            throw new RuntimeException("Claude non-2xx: status=" + response.statusCode());
+        }
+        JsonNode root = objectMapper.readTree(response.body());
+        JsonNode contentNode = root.path("content").path(0).path("text");
+        String content = contentNode.isMissingNode() ? null : contentNode.asText();
+        if (content == null || content.isBlank()) {
+            throw new RuntimeException("Claude returned empty content");
+        }
+        return content.trim();
+    }
+
+    private String buildClaudeRequestBody(String model, String prompt) throws Exception {
+        return objectMapper.createObjectNode()
+                .put("model", model)
+                .put("max_tokens", claudeMaxTokens)
+                .put("system",
+                        "You are a senior Business Analyst. Produce a concise, well-structured BRD in Markdown " +
+                        "with these sections: Overview & Purpose, Existing System Summary, Proposed Changes, " +
+                        "Business Rules, APIs to Consider, Risks & Assumptions, and Next Steps. " +
+                        "Be specific, actionable, and reference actual endpoints or classes where relevant.")
+                .set("messages", objectMapper.createArrayNode()
+                        .add(objectMapper.createObjectNode()
+                                .put("role", "user")
+                                .put("content", prompt)))
+                .toString();
+    }
+
+    private String buildClaudeRefineRequestBody(String model, String currentMarkdown, String userPrompt) throws Exception {
+        String truncated = currentMarkdown.length() > 12_000
+                ? currentMarkdown.substring(0, 12_000) + "\n… (truncated)"
+                : currentMarkdown;
+        return objectMapper.createObjectNode()
+                .put("model", model)
+                .put("max_tokens", claudeMaxTokens)
+                .put("system",
+                        "You are a senior Business Analyst editing an existing BRD. " +
+                        "Apply the user's instruction to the BRD and return the complete revised document " +
+                        "in Markdown. Keep the same structure (Overview & Purpose, Existing System Summary, " +
+                        "Proposed Changes, Business Rules, APIs to Consider, Risks & Assumptions, Next Steps) " +
+                        "unless the instruction explicitly requires changes to it. " +
+                        "Return only the full revised Markdown — no preamble, no explanation.")
+                .set("messages", objectMapper.createArrayNode()
+                        .add(objectMapper.createObjectNode()
+                                .put("role", "user")
+                                .put("content", "Existing BRD:\n\n" + truncated + "\n\n---\n\nInstruction: " + userPrompt)))
+                .toString();
+    }
+
+    // ── Prompt builder ────────────────────────────────────────────────────────
+
+    private String buildPrompt(String repoUrl, String featureContext, Object codeSummary) {
         StringBuilder sb = new StringBuilder();
         sb.append("Repository URL: ").append(repoUrl).append('\n');
         if (featureContext != null && !featureContext.isBlank()) {
-            sb.append("User Feature/Business Context: ").append(featureContext).append('\n');
+            sb.append("Feature / Business Context: ").append(featureContext).append('\n');
         }
-        if (summaryOrNull != null) {
-            sb.append("\nCode Analysis Summary (JSON, truncated if large):\n");
-            sb.append("```json\n").append(safeJson(summaryOrNull)).append("\n```\n");
+        if (codeSummary != null) {
+            String json = safeJson(codeSummary);
+            sb.append("\nCode Analysis Summary (truncated if large):\n```json\n").append(json).append("\n```\n");
         }
-        sb.append("\nPlease synthesize a BRD in Markdown based on the repository inputs and the code summary. Focus on business intent, current APIs/endpoints (if any), proposed changes related to the feature context, and clear, actionable next steps.");
+        sb.append("\nPlease synthesize a professional BRD in Markdown based on the above. ")
+                .append("Focus on business intent, current APIs/endpoints, proposed changes related to the feature context, and clear actionable next steps.");
         return sb.toString();
     }
 
     private String safeJson(Object obj) {
         try {
             String raw = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(obj);
-            // Limit extremely large payloads
-            if (raw.length() > 6000) {
-                return raw.substring(0, 6000) + "\n... (truncated)";
+            if (raw.length() > MAX_SUMMARY_CHARS) {
+                return raw.substring(0, MAX_SUMMARY_CHARS) + "\n... (truncated for token limit)";
             }
             return raw;
         } catch (Exception e) {
@@ -137,16 +373,19 @@ public class AiProcessingService {
         }
     }
 
-    private String fallbackMarkdown(String repoUrl, String featureContext, String note) {
-        String fc = featureContext == null || featureContext.isBlank() ? "(no feature context provided)" : featureContext;
-        return "# BRD (Fallback)\n\n" +
-                "> Note: " + note + "\n\n" +
+    // ── Fallback content ──────────────────────────────────────────────────────
+
+    private String buildStubMarkdown(String repoUrl, String featureContext, Object codeSummary) {
+        String fc = (featureContext == null || featureContext.isBlank()) ? "(no feature context provided)" : featureContext;
+        return "# BRD (Stub — No LLM Key Configured)\n\n" +
                 "## Overview & Purpose\n" +
-                "Generate BRD for the given repository and feature context.\n\n" +
+                "This is a placeholder BRD. Configure `llm.api.key` or `claude.api.key` in `application.properties` to enable AI-generated content.\n\n" +
                 "## Input Summary\n" +
-                "- Repository: " + repoUrl + "\n" +
-                "- Feature Context: " + fc + "\n\n" +
+                "- **Repository:** " + repoUrl + "\n" +
+                "- **Feature Context:** " + fc + "\n" +
+                (codeSummary != null ? "- **Code Summary (truncated):**\n```json\n" + safeJson(codeSummary) + "\n```\n\n" : "") +
                 "## Next Steps\n" +
-                "Re-run after resolving the LLM configuration.";
+                "1. Add `llm.api.key=<your-openai-key>` or `claude.api.key=<your-claude-key>` to `application.properties`.\n" +
+                "2. Re-submit the generation request.";
     }
 }

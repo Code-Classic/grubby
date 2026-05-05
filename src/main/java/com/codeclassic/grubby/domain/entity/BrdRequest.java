@@ -43,6 +43,12 @@ public class BrdRequest {
 
     private boolean forceReanalyze;
 
+    private String aiModel;
+
+    /** Slack Incoming Webhook URL copied from user profile at submit time. */
+    @Column(length = 500)
+    private String slackWebhookUrl;
+
     private Instant createdAt;
     private Instant updatedAt;
 

@@ -49,6 +49,11 @@ public class InMemoryCacheService {
         put(brdCache, key, markdown, brdTtlMillis);
     }
 
+    /** Explicitly removes a key from the BRD cache (e.g. after download to free memory sooner). */
+    public void removeBrd(String key) {
+        if (key != null) brdCache.remove(key);
+    }
+
     private <T> Optional<T> get(Map<String, Entry> map, String key, Class<T> type) {
         if (key == null) return Optional.empty();
         Entry e = map.get(key);

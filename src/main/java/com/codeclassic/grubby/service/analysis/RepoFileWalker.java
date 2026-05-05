@@ -64,6 +64,28 @@ public class RepoFileWalker {
         }
     }
 
+    /**
+     * Generic file walker: collects all files in repoRoot that end with the given extension.
+     * Uses the same maxFiles cap as listJavaFiles.
+     */
+    public List<Path> listFiles(Path repoRoot, String extension) throws IOException {
+        String ext = extension.startsWith(".") ? extension : "." + extension;
+        try (var s = Files.walk(repoRoot)) {
+            List<Path> files = s
+                    .filter(p -> Files.isRegularFile(p) && p.toString().endsWith(ext))
+                    .filter(p -> !isVendorPath(p))
+                    .limit(maxFiles)
+                    .collect(Collectors.toList());
+            log.info("Collected {} {} files for analysis", files.size(), ext);
+            return files;
+        }
+    }
+
+    private boolean isVendorPath(Path p) {
+        String s = p.toString().replace('\\', '/');
+        return s.contains("/node_modules/") || s.contains("/vendor/") || s.contains("/.git/");
+    }
+
     public String readHead(Path file) throws IOException {
         // Read up to maxBytesPerFile from the top of the file as a snippet
         byte[] bytes;
