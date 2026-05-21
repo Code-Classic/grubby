@@ -45,7 +45,7 @@ public class TimelineJobRunner {
         try {
             update(job, TimelineStatus.CLONING_REPO, "CLONING_REPO", 10);
             repoPath = git.cloneRepo(job.getId(), job.getRepoUrl(),
-                    job.getBranch(), null, job.getAuthToken());
+                    job.getBranch(), null, job.getAuthToken(), true);
 
             update(job, TimelineStatus.EXTRACTING_COMMITS, "EXTRACTING_COMMITS", 35);
             GitLogExtractorService.ExtractionResult result = extractor.extract(repoPath);

@@ -40,6 +40,11 @@ public class GitIntegrationService {
 
     public Path cloneRepo(long requestId, String repoUrl, String branch,
                           String commitSha, String authToken) throws GitAPIException, IOException {
+        return cloneRepo(requestId, repoUrl, branch, commitSha, authToken, false);
+    }
+
+    public Path cloneRepo(long requestId, String repoUrl, String branch,
+                          String commitSha, String authToken, boolean fullHistory) throws GitAPIException, IOException {
         Path root = Paths.get(workdirRoot).toAbsolutePath().normalize();
         Files.createDirectories(root);
         Path target = root.resolve("repo-" + requestId);
@@ -52,8 +57,11 @@ public class GitIntegrationService {
                         var cloneCmd = Git.cloneRepository()
                                 .setURI(repoUrl)
                                 .setDirectory(target.toFile())
-                                .setCloneAllBranches(false)
-                                .setDepth(1);
+                                .setCloneAllBranches(false);
+
+                        if (!fullHistory) {
+                            cloneCmd.setDepth(1);
+                        }
 
                         if (branch != null && !branch.isBlank()) {
                             cloneCmd.setBranch(branch);

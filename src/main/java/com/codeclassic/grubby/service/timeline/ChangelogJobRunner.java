@@ -39,7 +39,7 @@ public class ChangelogJobRunner {
         try {
             update(job, ChangelogStatus.CLONING_REPO, "CLONING_REPO", 15);
             repoPath = git.cloneRepo(job.getId(), job.getRepoUrl(),
-                    job.getBranch(), null, job.getAuthToken());
+                    job.getBranch(), null, job.getAuthToken(), true);
 
             update(job, ChangelogStatus.EXTRACTING_COMMITS, "EXTRACTING_COMMITS", 40);
             List<CommitRecord> commits = extractor.extractBetween(
